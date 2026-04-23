@@ -282,10 +282,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description="Additional kwargs for structured outputs",
     )
-    priority: int = Field(
+    priority: float = Field(
         default=0,
         ge=_INT64_MIN,
         le=_INT64_MAX,
+        allow_inf_nan=False,
         description=(
             "The priority of the request (lower means earlier handling; "
             "default: 0). Any priority other than 0 will raise an error "
@@ -867,7 +868,7 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
     top_k: int | None = None
     min_p: float | None = 0.0
     repetition_penalty: float | None = 1.0
-    length_penalty: float | None = 1.0
+    length_penalty: float = 1.0
     early_stopping: bool = False
     structured_outputs: StructuredOutputsParams | None = None
     request_id: str | None = None
