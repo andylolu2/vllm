@@ -172,7 +172,7 @@ class CohereEmbedRequest(BaseModel):
     embedding_types: list[CohereEmbeddingType] | None = None
     truncate: CohereTruncate = "END"
     max_tokens: int | None = None
-    priority: int = 0
+    priority: float = Field(default=0, allow_inf_nan=False)
 
 
 # ---------------------------------------------------------------------------
