@@ -104,10 +104,11 @@ class CompletionRequest(OpenAIBaseModel):
         default=None,
         description="Additional kwargs for structured outputs",
     )
-    priority: int = Field(
+    priority: float = Field(
         default=0,
         ge=_INT64_MIN,
         le=_INT64_MAX,
+        allow_inf_nan=False,
         description=(
             "The priority of the request (lower means earlier handling; "
             "default: 0). Any priority other than 0 will raise an error "
