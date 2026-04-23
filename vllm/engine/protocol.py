@@ -75,7 +75,7 @@ class EngineClient(ABC):
         lora_request: LoRARequest | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
         trace_headers: Mapping[str, str] | None = None,
-        priority: int = 0,
+        priority: float = 0,
         data_parallel_rank: int | None = None,
         reasoning_ended: bool | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
@@ -90,7 +90,7 @@ class EngineClient(ABC):
         request_id: str,
         lora_request: LoRARequest | None = None,
         trace_headers: Mapping[str, str] | None = None,
-        priority: int = 0,
+        priority: float = 0,
         tokenization_kwargs: dict[str, Any] | None = None,
         reasoning_ended: bool | None = None,
     ) -> AsyncGenerator[PoolingRequestOutput, None]:

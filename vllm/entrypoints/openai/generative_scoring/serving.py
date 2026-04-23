@@ -91,8 +91,9 @@ class GenerativeScoringRequest(OpenAIBaseModel):
         default=True,
         description="Whether to add special tokens when tokenizing.",
     )
-    priority: int = Field(
+    priority: float = Field(
         default=0,
+        allow_inf_nan=False,
         description=(
             "The priority of the request (lower means earlier handling; default: 0)."
         ),
