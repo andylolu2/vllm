@@ -868,7 +868,7 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
     top_k: int | None = None
     min_p: float | None = 0.0
     repetition_penalty: float | None = 1.0
-    length_penalty: float = 1.0
+    length_penalty: float | None = 1.0
     early_stopping: bool = False
     structured_outputs: StructuredOutputsParams | None = None
     request_id: str | None = None
