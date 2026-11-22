@@ -105,6 +105,20 @@ class CPURequestState:
         self.num_computed_prefill_tokens[req_idx] = num_computed_tokens
         self.num_computed_tokens_np[req_idx] = num_computed_tokens
 
+    def extend_prompt(
+        self, req_idx: int, start: int, token_ids: list[int], max_tokens: int
+    ) -> None:
+        """Make the first `start` tokens followed by `token_ids` the prompt,
+        folding in the outputs before `start` and dropping those after it."""
+        prompt_len = start + len(token_ids)
+        self.max_seq_len[req_idx] = prompt_len + max_tokens
+        self.prompt_len_np[req_idx] = prompt_len
+        self.prefill_len_np[req_idx] = prompt_len
+        self.total_len[req_idx] = prompt_len
+        self.all_token_ids[req_idx, start:prompt_len] = token_ids_to_tensor(
+            token_ids, dtype=torch.int32
+        )
+
     def remove_request(self, req_id: str) -> int | None:
         """Return the freed slot index, or None if the request was not found."""
         req_idx = self.req_id_to_index.pop(req_id, None)

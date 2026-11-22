@@ -117,6 +117,20 @@ class RequestState:
         if self.num_speculative_steps > 0:
             self.draft_tokens[req_idx].zero_()
 
+    def extend_prompt(
+        self, req_idx: int, start: int, token_ids: list[int], max_tokens: int
+    ) -> None:
+        """Make the first `start` tokens followed by `token_ids` the prompt,
+        folding in the outputs before `start` and dropping those after it.
+
+        Must not be called with a step of the request in flight."""
+        prompt_len = start + len(token_ids)
+        self.max_seq_len[req_idx] = prompt_len + max_tokens
+        self.prompt_len.np[req_idx] = prompt_len
+        self.prefill_len.np[req_idx] = prompt_len
+        self.total_len.stage_write_elem(req_idx, prompt_len)
+        self.all_token_ids.stage_write(req_idx, start, token_ids)
+
     def apply_staged_writes(self) -> None:
         self.prompt_len.copy_to_uva()
         self.prefill_len.copy_to_uva()

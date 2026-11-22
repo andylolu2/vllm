@@ -209,6 +209,8 @@ class EngineCoreRequest(
 
     trace_headers: Mapping[str, str] | None = None
     resumable: bool = False
+    # See StreamingInput.keep_last_output_token.
+    keep_last_output_token: bool = False
 
     # The user-provided request ID. This field is set internally,
     # copied from the provided request_id that's originally assigned

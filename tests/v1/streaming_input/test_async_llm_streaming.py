@@ -249,10 +249,14 @@ def _make_streaming_llm(
     return llm, reqs
 
 
-async def _stream_chunks(llm: AsyncLLM, num_chunks: int) -> RequestOutputCollector:
+async def _stream_chunks(
+    llm: AsyncLLM, num_chunks: int, keep_last_output_token: bool = False
+) -> RequestOutputCollector:
     async def chunks():
         for i in range(num_chunks):
-            yield StreamingInput(prompt=f"frame-{i}")
+            yield StreamingInput(
+                prompt=f"frame-{i}", keep_last_output_token=keep_last_output_token
+            )
 
     with mock.patch(
         "vllm.v1.engine.async_llm.extract_prompt_components",
@@ -284,20 +288,29 @@ async def test_handle_inputs_stops_after_session_finished(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("keep_last_output_token", [False, True])
 @pytest.mark.parametrize("empty_chunk", [0, 1])
-async def test_only_continuation_chunks_may_be_empty(
-    empty_chunk: int, monkeypatch: pytest.MonkeyPatch
+async def test_only_kept_continuation_chunks_may_be_empty(
+    empty_chunk: int, keep_last_output_token: bool, monkeypatch: pytest.MonkeyPatch
 ):
     """A chunk without tokens builds on the previous chunk's kept sample, which
     the first chunk does not have."""
     llm, reqs = _make_streaming_llm(monkeypatch, num_chunks=2)
     reqs[1 + empty_chunk].prompt_token_ids = []
-    queue = await _stream_chunks(llm, num_chunks=2)
+    queue = await _stream_chunks(
+        llm, num_chunks=2, keep_last_output_token=keep_last_output_token
+    )
 
     sent = [call.args[0] for call in llm._add_request.await_args_list]
     if empty_chunk == 0:
         assert sent == []
         with pytest.raises(InputStreamError, match="first streaming input chunk"):
             queue.get_nowait()
+    elif not keep_last_output_token:
+        # The first chunk, then the final request that closes the session.
+        assert sent == [reqs[1], reqs[0]]
+        with pytest.raises(InputStreamError, match="keep_last_output_token"):
+            queue.get_nowait()
     else:
         assert sent == [reqs[1], reqs[2], reqs[0]]
+        assert reqs[2].keep_last_output_token

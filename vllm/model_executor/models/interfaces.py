@@ -1344,9 +1344,10 @@ class SupportsRealtime(Protocol):
     Override in subclasses based on the model's expected output length."""
 
     realtime_keep_last_output_token: ClassVar[bool] = False
-    """Whether audio segments after the first carry no tokens, so that each
-    continues from the last token sampled for the previous one. If so, output
-    tokens are not fed back through `input_stream`."""
+    """Whether each audio segment after the first continues from the last token
+    sampled for the previous one, which the engine keeps (see
+    `StreamingInput.keep_last_output_token`). If so, output tokens are not fed
+    back through `input_stream`."""
 
     @classmethod
     def buffer_realtime_audio(

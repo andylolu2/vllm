@@ -35,13 +35,18 @@ class StreamingInput:
     This is used with generate() to support multi-turn streaming sessions
     where inputs are provided via an async generator.
 
-    Each input discards the token sampled for the previous one, unless it has
-    no prompt tokens: it then continues from that token, and its multimodal
-    data is placed at that token. The first input must have prompt tokens.
+    Each input appends to the session: the tokens sampled for the previous
+    input become prompt tokens, followed by this input's. The first input must
+    have prompt tokens.
     """
 
     prompt: PromptType | EngineInput
     sampling_params: SamplingParams | None = None
+    keep_last_output_token: bool = False
+    """Continue from the last token sampled for the previous input, as this
+    input's first token, instead of discarding it. An input without prompt
+    tokens must keep it. Multimodal placeholder offsets count from this input's
+    first token. Ignored for the first input."""
 
 
 class EngineClient(ABC):

@@ -1383,6 +1383,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.encoder_cache is not None:
             for req_id, new_mm_features in reqs.new_mm_features.items():
                 self.encoder_cache.mm_features[req_id].extend(new_mm_features)
+        for req_id, ext in reqs.prompt_extensions.items():
+            req_index = self.req_states.req_id_to_index[req_id]
+            self.req_states.extend_prompt(
+                req_index,
+                ext.start,
+                ext.token_ids,
+                ext.sampling_params.max_tokens,  # type: ignore[arg-type]
+            )
+            # Re-admit to the sampler, whose state (e.g. penalties, min_tokens)
+            # depends on the prompt.
+            if self.is_last_pp_rank:
+                assert self.sampler is not None
+                self.sampler.add_request(req_index, ext.sampling_params)
+                assert self.prompt_logprobs_worker is not None
+                self.prompt_logprobs_worker.add_request(
+                    req_id, req_index, ext.sampling_params
+                )
+        if reqs.prompt_extensions:
+            self.req_states.apply_staged_writes()
+            if self.sampler is not None:
+                self.sampler.apply_staged_writes()
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(

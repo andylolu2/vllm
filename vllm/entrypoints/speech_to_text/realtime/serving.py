@@ -86,4 +86,7 @@ class OpenAIServingRealtime(GenerateBaseServing):
             parsed_prompt = parse_model_prompt(model_config, prompt)
             (engine_input,) = await renderer.render_cmpl_async([parsed_prompt])
 
-            yield StreamingInput(prompt=engine_input)
+            yield StreamingInput(
+                prompt=engine_input,
+                keep_last_output_token=self.model_cls.realtime_keep_last_output_token,
+            )

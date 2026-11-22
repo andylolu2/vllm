@@ -46,6 +46,7 @@ class StreamingUpdate:
     max_tokens: int
     arrival_time: float
     sampling_params: SamplingParams | None
+    keep_last_output_token: bool
 
     @classmethod
     def from_request(cls, request: "Request") -> "StreamingUpdate | None":
@@ -57,6 +58,7 @@ class StreamingUpdate:
             max_tokens=request.max_tokens,
             arrival_time=request.arrival_time,
             sampling_params=request.sampling_params,
+            keep_last_output_token=request.keep_last_output_token,
         )
 
 
@@ -78,6 +80,7 @@ class Request:
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
+        keep_last_output_token: bool = False,
         session_id: str | None = None,
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
@@ -253,6 +256,9 @@ class Request:
 
         # Used for streaming
         self.resumable = resumable
+        # As a streaming update: continue from the session's last sampled token
+        # instead of discarding it. See StreamingInput.
+        self.keep_last_output_token = keep_last_output_token
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
 
@@ -283,6 +289,7 @@ class Request:
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
             resumable=request.resumable,
+            keep_last_output_token=request.keep_last_output_token,
             session_id=request.session_id,
             kv_hints=request.kv_hints,
             reasoning_ended=request.reasoning_ended,

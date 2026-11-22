@@ -3,21 +3,26 @@
 
 """Unit tests for MRv2 GPUModelRunner.add_requests streaming input support."""
 
+from unittest.mock import MagicMock
+
+import pytest
 import torch
 
 from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     NewRequestData,
+    PromptExtension,
     SchedulerOutput,
 )
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 
 
-def _make_scheduler_output(new_reqs):
+def _make_scheduler_output(new_reqs, cached_reqs=None):
     return SchedulerOutput(
         scheduled_new_reqs=new_reqs,
-        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        scheduled_cached_reqs=cached_reqs or CachedRequestData.make_empty(),
         num_scheduled_tokens={},
         total_num_scheduled_tokens=0,
         scheduled_spec_decode_tokens={},
@@ -168,3 +173,90 @@ def test_e2e_streaming_with_multimodal_features(
 
     # Verify updated prefill length
     assert req_states.prefill_len.np[new_idx] == 21
+
+
+@pytest.mark.parametrize(
+    ("start", "new_token_ids"),
+    [(5, []), (5, [20, 21]), (4, [20, 21])],
+    ids=["kept_token", "kept_token_and_new_tokens", "new_tokens"],
+)
+def test_prompt_extension_matches_readmission(
+    gpu_model_runner_for_requests, start, new_token_ids
+):
+    """Extending a request's prompt in place leaves its state as re-admitting
+    it with the folded prompt would, and re-admits it to the sampler."""
+    runner = gpu_model_runner_for_requests
+    runner.sampler = MagicMock()
+    runner.prompt_logprobs_worker = MagicMock()
+    req_states = runner.req_states
+    sampling_params = SamplingParams(max_tokens=4)
+    # The workers hold the prompt and the samples 10 and 11, of which only 10
+    # has been computed.
+    held = [1, 2, 3, 10, 11]
+    folded = held[:start] + new_token_ids
+
+    def new_req_data(req_id, prompt_token_ids, prefill_token_ids):
+        return NewRequestData(
+            req_id=req_id,
+            prompt_token_ids=prompt_token_ids,
+            prefill_token_ids=prefill_token_ids,
+            mm_features=[],
+            sampling_params=sampling_params,
+            pooling_params=None,
+            block_ids=([0],),
+            num_computed_tokens=4,
+            lora_request=None,
+        )
+
+    runner.add_requests(
+        _make_scheduler_output(
+            [
+                new_req_data("in_place", [1, 2, 3], held),
+                new_req_data("readmitted", folded, folded),
+            ]
+        )
+    )
+    runner.sampler.reset_mock()
+    runner.prompt_logprobs_worker.reset_mock()
+
+    runner.update_requests(
+        _make_scheduler_output(
+            [],
+            CachedRequestData(
+                req_ids=["in_place"],
+                new_token_ids=[],
+                new_block_ids=[None],
+                num_computed_tokens=[4],
+                num_output_tokens=[0],
+                prompt_extensions={
+                    "in_place": PromptExtension(
+                        start=start,
+                        token_ids=new_token_ids,
+                        sampling_params=sampling_params,
+                    )
+                },
+            ),
+        )
+    )
+
+    i = req_states.req_id_to_index["in_place"]
+    j = req_states.req_id_to_index["readmitted"]
+    for state in (
+        req_states.prompt_len.np,
+        req_states.prefill_len.np,
+        req_states.max_seq_len,
+        req_states.num_computed_tokens_np,
+        req_states.num_computed_prefill_tokens,
+    ):
+        assert state[i] == state[j]
+    assert req_states.prompt_len.np[i] == len(folded)
+    total_len = req_states.total_len.gpu.cpu()
+    assert total_len[i] == total_len[j] == len(folded)
+    all_token_ids = req_states.all_token_ids.gpu[:, : len(folded)].cpu()
+    assert all_token_ids[i].tolist() == all_token_ids[j].tolist() == folded
+
+    runner.sampler.add_request.assert_called_once_with(i, sampling_params)
+    runner.sampler.apply_staged_writes.assert_called_once()
+    runner.prompt_logprobs_worker.add_request.assert_called_once_with(
+        "in_place", i, sampling_params
+    )

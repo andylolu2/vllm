@@ -675,15 +675,22 @@ class AsyncLLM(EngineClient):
                         **inputs,  # type: ignore[arg-type]
                     )
                     req.external_req_id = request_id
+                    req.keep_last_output_token = input_chunk.keep_last_output_token
                     if req.prompt_embeds is not None:
                         raise VLLMValidationError(
                             "prompt_embeds not supported for streaming inputs"
                         )
-                    if not any_added and not req.prompt_token_ids:
+                    if not req.prompt_token_ids:
                         # Only continuations have a sampled token to build on.
-                        raise VLLMValidationError(
-                            "The first streaming input chunk cannot be empty"
-                        )
+                        if not any_added:
+                            raise VLLMValidationError(
+                                "The first streaming input chunk cannot be empty"
+                            )
+                        if not req.keep_last_output_token:
+                            raise VLLMValidationError(
+                                "A streaming input chunk without prompt tokens "
+                                "must set keep_last_output_token"
+                            )
                     prompt_text, _, _ = extract_prompt_components(
                         self.model_config, input_chunk.prompt
                     )

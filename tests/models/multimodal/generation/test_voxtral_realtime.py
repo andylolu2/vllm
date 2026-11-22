@@ -239,7 +239,7 @@ async def test_voxtral_realtime_generator(audio_assets, tokenizer, async_engine)
             (engine_input,) = await async_engine.renderer.render_cmpl_async(
                 [parsed_prompt]
             )
-            yield StreamingInput(prompt=engine_input)
+            yield StreamingInput(prompt=engine_input, keep_last_output_token=True)
 
     output_tokens_list = []
     for i, audio_asset in enumerate(audio_assets):
@@ -330,7 +330,7 @@ async def test_voxtral_realtime_generator_max_model_len(
             (engine_input,) = await async_engine.renderer.render_cmpl_async(
                 [parsed_prompt]
             )
-            yield StreamingInput(prompt=engine_input)
+            yield StreamingInput(prompt=engine_input, keep_last_output_token=True)
 
     # winning_call is ~300 tokens long, well past max_model_len.
     audio = Audio.from_file(audio_assets[1].get_local_path(), strict=False)

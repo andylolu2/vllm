@@ -51,6 +51,7 @@ from vllm.v1.core.sched.output import (
     IterationDetails,
     KVConnectorBlockState,
     NewRequestData,
+    PromptExtension,
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import (
@@ -402,6 +403,8 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self._pending_encoder_input_ids: dict[str, set[int]] = {}
+        # Prompt extensions of sessions resumed in place, until next scheduled.
+        self._pending_prompt_extensions: dict[str, PromptExtension] = {}
         # Scheduler iteration counter. Drives the PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
@@ -1909,6 +1912,7 @@ class Scheduler(SchedulerInterface):
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._pending_encoder_input_ids.pop(request.request_id, None)
+        self._pending_prompt_extensions.pop(request.request_id, None)
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
@@ -1975,19 +1979,22 @@ class Scheduler(SchedulerInterface):
     ) -> bool:
         """Updates the waiting session with the next streaming update.
 
-        Discards the last sampled output token from the prior input chunk,
-        unless the update has no prompt tokens. The session then continues from
-        that token and may resume in place: it stays scheduled with its worker
-        state instead of being re-sent to the workers in full.
+        Folds the outputs for the prior input chunk into the prompt, discarding
+        the last sampled one unless the update keeps it, and appends the
+        update's tokens. The session may then resume in place: it keeps its
+        worker state, which extends its prompt the same way, instead of being
+        re-sent to the workers in full.
         Returns False if the update was dropped for exceeding max_model_len.
         """
-        # Position of the update's first input. Without new tokens, the last
-        # sample is kept as the input its multimodal features are added to.
+        # Position of the update's first input: the last sample, if kept.
         start = session.num_tokens - 1
-        # Keep all output tokens, but the final sampled one only if the update
-        # has no tokens.
-        keep_end = start if update.prompt_token_ids else session.num_tokens
-        new_num_tokens = keep_end + len(update.prompt_token_ids or ())
+        keep_end = session.num_tokens if update.keep_last_output_token else start
+        new_token_ids = update.prompt_token_ids or []
+        assert update.keep_last_output_token or new_token_ids, (
+            f"Streaming update for request {session.request_id} has no tokens "
+            "and does not keep the last sampled token"
+        )
+        new_num_tokens = keep_end + len(new_token_ids)
         if new_num_tokens + self.num_sampled_tokens_per_step > self.max_model_len:
             logger.warning(
                 "Dropping streaming update for request %s: session would "
@@ -1999,28 +2006,16 @@ class Scheduler(SchedulerInterface):
             return False
 
         assert start >= session.num_computed_tokens
+        in_place = self._can_resume_in_place(session, update)
         if update.mm_features:
             for mm_feature in update.mm_features:
                 mm_feature.mm_position = replace(
                     mm_feature.mm_position, offset=mm_feature.mm_position.offset + start
                 )
             session.mm_features.extend(update.mm_features)
-        del session.block_hashes[start // self.hash_block_size :]
-
-        parked = session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
-        if self._can_resume_in_place(session, update):
-            session.update_block_hashes()
-            if parked:
-                self.num_waiting_for_streaming_input -= 1
-                self.kv_holding_waiting.remove_request(session)
-                self.deferred_waiting.discard(session)
-                self.running.append(session)
-            session.arrival_time = update.arrival_time
-            session.max_tokens += update.max_tokens
-            session.status = RequestStatus.RUNNING
-            return True
 
         del session._all_token_ids[keep_end:]
+        del session.block_hashes[start // self.hash_block_size :]
         session._output_token_ids.clear()
         assert session.prompt_token_ids is not None
         # Extend prompt with kept output tokens.
@@ -2031,8 +2026,8 @@ class Scheduler(SchedulerInterface):
             keep_end,
         )
 
-        session._all_token_ids.extend(update.prompt_token_ids or ())
-        session.prompt_token_ids.extend(update.prompt_token_ids or ())
+        session._all_token_ids.extend(new_token_ids)
+        session.prompt_token_ids.extend(new_token_ids)
         # Update block hashes for the new tokens.
         session.update_block_hashes()
         session.num_prompt_tokens = len(session.prompt_token_ids)
@@ -2040,10 +2035,25 @@ class Scheduler(SchedulerInterface):
         session.sampling_params = update.sampling_params
         session.prefix_cache_hit_limit = session.get_prefix_cache_hit_limit()
         session.max_tokens = update.max_tokens
+        parked = session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
         if parked:
             self.num_waiting_for_streaming_input -= 1
-        session.status = RequestStatus.WAITING
 
+        if in_place:
+            assert session.sampling_params is not None
+            self._pending_prompt_extensions[session.request_id] = PromptExtension(
+                start=keep_end,
+                token_ids=new_token_ids,
+                sampling_params=session.sampling_params,
+            )
+            if parked:
+                self.kv_holding_waiting.remove_request(session)
+                self.deferred_waiting.discard(session)
+                self.running.append(session)
+            session.status = RequestStatus.RUNNING
+            return True
+
+        session.status = RequestStatus.WAITING
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
         return True
@@ -2060,14 +2070,20 @@ class Scheduler(SchedulerInterface):
 
     def _can_resume_in_place(self, session: Request, update: StreamingUpdate) -> bool:
         return (
-            not update.prompt_token_ids
-            and session.sampling_params == update.sampling_params
+            session.sampling_params == update.sampling_params
+            # Prompt logprobs and skipped prefix cache reads make re-admission
+            # recompute the prompt.
+            and session.prefix_cache_hit_limit is None
             # Preemption releases the KV cache and the worker state, and moves
             # the session to the waiting queue.
             and session.num_computed_tokens > 0
-            # The worker's last sample must be the session's last token. A stop
-            # before max_tokens can leave a step in flight that samples past it.
-            and session.num_output_tokens >= session.max_tokens
+            # The worker's last sample must be the session's last token. Under
+            # async scheduling, a stop before max_tokens can leave a step in
+            # flight that samples past it.
+            and (
+                not self.scheduler_config.async_scheduling
+                or session.num_output_tokens >= session.max_tokens
+            )
             # Workers derive M-RoPE positions and prefix-LM attention ranges from
             # the features at admission.
             and not self.model_uses_mrope
@@ -2090,6 +2106,7 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         new_mm_features: dict[str, list[MultiModalFeatureSpec]] = {}
+        prompt_extensions: dict[str, PromptExtension] = {}
 
         for req in running_reqs:
             req_id = req.request_id
@@ -2097,6 +2114,8 @@ class Scheduler(SchedulerInterface):
             if len(req.mm_features) > req.num_sent_mm_features:
                 new_mm_features[req_id] = req.mm_features[req.num_sent_mm_features :]
                 req.num_sent_mm_features = len(req.mm_features)
+            if prompt_extension := self._pending_prompt_extensions.pop(req_id, None):
+                prompt_extensions[req_id] = prompt_extension
             is_prefill = req.is_prefill_chunk
             # NOTE: In PP+async scheduling, we consume token ids via a direct GPU
             # broadcast path (`input_batch.prev_sampled_token_ids`), so we can
@@ -2133,6 +2152,7 @@ class Scheduler(SchedulerInterface):
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
             new_mm_features=new_mm_features,
+            prompt_extensions=prompt_extensions,
         )
 
     def _reject_on_encoder_cache_embed_mismatch(
@@ -3326,6 +3346,7 @@ class Scheduler(SchedulerInterface):
 
         self.encoder_cache_manager.free(request)
         self._pending_encoder_input_ids.pop(request.request_id, None)
+        self._pending_prompt_extensions.pop(request.request_id, None)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:

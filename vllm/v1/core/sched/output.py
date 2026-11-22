@@ -136,6 +136,17 @@ class NewRequestData:
 
 
 @dataclass
+class PromptExtension:
+    """Resumes a streaming session in place: the request's first `start` tokens
+    followed by `token_ids` become its prompt, as if it was re-admitted with
+    that prompt but kept its KV cache."""
+
+    start: int
+    token_ids: list[int]
+    sampling_params: SamplingParams
+
+
+@dataclass
 class CachedRequestData:
     req_ids: list[str]
     # NOTE(woosuk): new_token_ids is only used for pipeline parallelism.
@@ -150,6 +161,8 @@ class CachedRequestData:
     new_mm_features: dict[str, list[MultiModalFeatureSpec]] = field(
         default_factory=dict
     )
+    # Streaming input chunks that resume a request in place.
+    prompt_extensions: dict[str, PromptExtension] = field(default_factory=dict)
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
