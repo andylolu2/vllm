@@ -32,6 +32,15 @@ def _make_scheduler_output(new_reqs, cached_reqs=None):
     )
 
 
+def _audio_feature(identifier, offset, length):
+    return MultiModalFeatureSpec(
+        data=None,
+        modality="audio",
+        identifier=identifier,
+        mm_position=PlaceholderRange(offset=offset, length=length),
+    )
+
+
 def test_e2e_streaming_request_update_basic_flow(
     gpu_model_runner_for_requests,
 ):
@@ -184,23 +193,31 @@ def test_prompt_extension_matches_readmission(
     gpu_model_runner_for_requests, start, new_token_ids
 ):
     """Extending a request's prompt in place leaves its state as re-admitting
-    it with the folded prompt would, and re-admits it to the sampler."""
+    it with the folded prompt and features would, and re-admits it to the
+    sampler."""
     runner = gpu_model_runner_for_requests
     runner.sampler = MagicMock()
     runner.prompt_logprobs_worker = MagicMock()
+    runner.encoder_cache = EncoderCache()
     req_states = runner.req_states
     sampling_params = SamplingParams(max_tokens=4)
     # The workers hold the prompt and the samples 10 and 11, of which only 10
     # has been computed.
     held = [1, 2, 3, 10, 11]
     folded = held[:start] + new_token_ids
+    held_features = [_audio_feature("audio-0", offset=1, length=1)]
+    new_features = (
+        [_audio_feature("audio-1", offset=start, length=len(new_token_ids))]
+        if new_token_ids
+        else []
+    )
 
-    def new_req_data(req_id, prompt_token_ids, prefill_token_ids):
+    def new_req_data(req_id, prompt_token_ids, prefill_token_ids, mm_features):
         return NewRequestData(
             req_id=req_id,
             prompt_token_ids=prompt_token_ids,
             prefill_token_ids=prefill_token_ids,
-            mm_features=[],
+            mm_features=mm_features,
             sampling_params=sampling_params,
             pooling_params=None,
             block_ids=([0],),
@@ -211,8 +228,10 @@ def test_prompt_extension_matches_readmission(
     runner.add_requests(
         _make_scheduler_output(
             [
-                new_req_data("in_place", [1, 2, 3], held),
-                new_req_data("readmitted", folded, folded),
+                new_req_data("in_place", [1, 2, 3], held, held_features),
+                new_req_data(
+                    "readmitted", folded, folded, held_features + new_features
+                ),
             ]
         )
     )
@@ -232,6 +251,7 @@ def test_prompt_extension_matches_readmission(
                     "in_place": PromptExtension(
                         start=start,
                         token_ids=new_token_ids,
+                        mm_features=new_features,
                         sampling_params=sampling_params,
                     )
                 },
@@ -254,6 +274,11 @@ def test_prompt_extension_matches_readmission(
     assert total_len[i] == total_len[j] == len(folded)
     all_token_ids = req_states.all_token_ids.gpu[:, : len(folded)].cpu()
     assert all_token_ids[i].tolist() == all_token_ids[j].tolist() == folded
+    assert (
+        runner.encoder_cache.mm_features["in_place"]
+        == runner.encoder_cache.mm_features["readmitted"]
+        == held_features + new_features
+    )
 
     runner.sampler.add_request.assert_called_once_with(i, sampling_params)
     runner.sampler.apply_staged_writes.assert_called_once()

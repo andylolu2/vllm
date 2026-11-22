@@ -687,10 +687,9 @@ class StandaloneCPUModelRunner(LoRAModelRunnerMixin):
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
-        if self.encoder_cache is not None:
-            for req_id, new_mm_features in reqs.new_mm_features.items():
-                self.encoder_cache.mm_features[req_id].extend(new_mm_features)
         for req_id, ext in reqs.prompt_extensions.items():
+            if self.encoder_cache is not None:
+                self.encoder_cache.mm_features[req_id].extend(ext.mm_features)
             req_index = self.req_states.req_id_to_index[req_id]
             self.req_states.extend_prompt(
                 req_index,

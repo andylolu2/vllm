@@ -411,9 +411,11 @@ class WorkerWrapperBase:
             req_data.mm_features = mm_cache.get_and_update_features(
                 req_data.mm_features
             )
-        new_mm_features = scheduler_output.scheduled_cached_reqs.new_mm_features
-        for req_id, features in new_mm_features.items():
-            new_mm_features[req_id] = mm_cache.get_and_update_features(features)
+        prompt_extensions = scheduler_output.scheduled_cached_reqs.prompt_extensions
+        for extension in prompt_extensions.values():
+            extension.mm_features = mm_cache.get_and_update_features(
+                extension.mm_features
+            )
 
     def execute_model(
         self, scheduler_output: SchedulerOutput

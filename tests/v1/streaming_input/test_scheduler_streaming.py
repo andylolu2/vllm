@@ -948,10 +948,10 @@ def test_session_resumes_in_place(async_scheduling, chunk_queued_before_stop):
             "session": PromptExtension(
                 start=session.num_tokens,
                 token_ids=[],
+                mm_features=[feature],
                 sampling_params=chunk.sampling_params,
             )
         }
-        assert output.scheduled_cached_reqs.new_mm_features == {"session": [feature]}
         assert output.scheduled_encoder_inputs == {"session": [i]}
         # The workers release the previous chunk's encoder input once computed.
         assert output.encoder_input_updates == ({"session": {0: None}} if i else {})
@@ -975,7 +975,11 @@ def test_resume_in_place_matches_rebuild(
         scheduler = create_async_scheduler(model="llava-hf/llava-1.5-7b-hf")
         if not in_place:
             monkeypatch.setattr(scheduler, "_can_resume_in_place", lambda *_: False)
-        session = _chunk(prompt_token_ids=prompt, max_tokens=2)
+        session = _chunk(
+            prompt_token_ids=prompt,
+            mm_features=[_audio_feature(offset=2, identifier="audio-0")],
+            max_tokens=2,
+        )
         scheduler.add_request(session)
         for sampled in (30, 31):
             output = scheduler.schedule()
@@ -984,11 +988,12 @@ def test_resume_in_place_matches_rebuild(
         # session's tokens.
         worker_token_ids = list(session.all_token_ids)
         worker_num_computed_tokens = session.num_computed_tokens
+        worker_mm_features = list(session.mm_features)
 
         scheduler.add_request(
             _chunk(
                 prompt_token_ids=new_token_ids,
-                mm_features=[_audio_feature(offset=0, identifier="audio")],
+                mm_features=[_audio_feature(offset=0, identifier="audio-1")],
                 keep_last_output_token=keep_last_output_token,
                 max_tokens=2,
             )
@@ -1000,6 +1005,7 @@ def test_resume_in_place_matches_rebuild(
             worker_token_ids = worker_token_ids[: ext.start] + ext.token_ids
             worker_prompt_len = len(worker_token_ids)
             worker_sampling_params = ext.sampling_params
+            worker_mm_features += ext.mm_features
         else:
             [new_req] = output.scheduled_new_reqs
             assert not output.scheduled_cached_reqs.prompt_extensions
@@ -1008,6 +1014,7 @@ def test_resume_in_place_matches_rebuild(
             worker_prompt_len = len(new_req.prompt_token_ids)
             worker_sampling_params = new_req.sampling_params
             worker_num_computed_tokens = new_req.num_computed_tokens
+            worker_mm_features = new_req.mm_features
         return {
             "prompt_token_ids": list(session.prompt_token_ids),
             "all_token_ids": list(session.all_token_ids),
@@ -1022,6 +1029,9 @@ def test_resume_in_place_matches_rebuild(
             "worker_prompt_len": worker_prompt_len,
             "worker_num_computed_tokens": worker_num_computed_tokens,
             "worker_sampling_params": worker_sampling_params,
+            "worker_mm_features": [
+                (f.identifier, f.mm_position.offset) for f in worker_mm_features
+            ],
         }
 
     in_place = resume(in_place=True)
@@ -1029,7 +1039,10 @@ def test_resume_in_place_matches_rebuild(
     kept = [31] if keep_last_output_token else []
     assert in_place["worker_token_ids"] == [*prompt, 30, *kept, *new_token_ids]
     assert in_place["worker_prompt_len"] == len(in_place["worker_token_ids"])
-    assert in_place["mm_offsets"] == [len(prompt) + 1]
+    assert in_place["worker_mm_features"] == [
+        ("audio-0", 2),
+        ("audio-1", len(prompt) + 1),
+    ]
 
 
 @pytest.mark.parametrize("chunk_queued_before_stop", [False, True])

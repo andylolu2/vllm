@@ -138,11 +138,12 @@ class NewRequestData:
 @dataclass
 class PromptExtension:
     """Resumes a streaming session in place: the request's first `start` tokens
-    followed by `token_ids` become its prompt, as if it was re-admitted with
-    that prompt but kept its KV cache."""
+    followed by `token_ids` become its prompt, and `mm_features` are appended to
+    its features, as if it was re-admitted with them but kept its KV cache."""
 
     start: int
     token_ids: list[int]
+    mm_features: list[MultiModalFeatureSpec]
     sampling_params: SamplingParams
 
 
@@ -156,11 +157,6 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
-    # Multimodal features appended to a request since it was last sent, e.g. by
-    # a streaming input chunk that resumes the request in place.
-    new_mm_features: dict[str, list[MultiModalFeatureSpec]] = field(
-        default_factory=dict
-    )
     # Streaming input chunks that resume a request in place.
     prompt_extensions: dict[str, PromptExtension] = field(default_factory=dict)
 

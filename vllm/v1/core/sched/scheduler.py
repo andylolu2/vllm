@@ -33,7 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
-from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalKwargsItem
+from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
 from vllm.utils.math_utils import cdiv
@@ -1751,8 +1751,6 @@ class Scheduler(SchedulerInterface):
             )
             for req in scheduled_new_reqs
         ]
-        for req in scheduled_new_reqs:
-            req.num_sent_mm_features = len(req.mm_features)
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
@@ -1833,7 +1831,7 @@ class Scheduler(SchedulerInterface):
             encoder_input_updates=self._get_encoder_input_updates(
                 num_scheduled_tokens,
                 new_reqs_data,
-                cached_reqs_data.new_mm_features,
+                cached_reqs_data.prompt_extensions,
                 scheduled_encoder_inputs,
             ),
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
@@ -2044,6 +2042,7 @@ class Scheduler(SchedulerInterface):
             self._pending_prompt_extensions[session.request_id] = PromptExtension(
                 start=keep_end,
                 token_ids=new_token_ids,
+                mm_features=update.mm_features or [],
                 sampling_params=session.sampling_params,
             )
             if parked:
@@ -2105,15 +2104,11 @@ class Scheduler(SchedulerInterface):
         new_block_ids: list[tuple[list[int], ...] | None] = []
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
-        new_mm_features: dict[str, list[MultiModalFeatureSpec]] = {}
         prompt_extensions: dict[str, PromptExtension] = {}
 
         for req in running_reqs:
             req_id = req.request_id
             req_ids.append(req_id)
-            if len(req.mm_features) > req.num_sent_mm_features:
-                new_mm_features[req_id] = req.mm_features[req.num_sent_mm_features :]
-                req.num_sent_mm_features = len(req.mm_features)
             if prompt_extension := self._pending_prompt_extensions.pop(req_id, None):
                 prompt_extensions[req_id] = prompt_extension
             is_prefill = req.is_prefill_chunk
@@ -2151,7 +2146,6 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
-            new_mm_features=new_mm_features,
             prompt_extensions=prompt_extensions,
         )
 
@@ -3059,7 +3053,7 @@ class Scheduler(SchedulerInterface):
         self,
         scheduled: dict[str, int],
         new_requests: list[NewRequestData],
-        new_mm_features: dict[str, list[MultiModalFeatureSpec]],
+        prompt_extensions: dict[str, PromptExtension],
         scheduled_encoder_inputs: dict[str, list[int]],
     ) -> dict[str, dict[int, MultiModalKwargsItem | None]]:
         # Installations (including resume/streaming) replace worker features.
@@ -3073,8 +3067,9 @@ class Scheduler(SchedulerInterface):
                 for i, feature in enumerate(new_request.mm_features)
                 if feature.data is not None and "address" not in feature.data
             }
-        # Features appended to running requests extend the worker features.
-        for req_id, features in new_mm_features.items():
+        # Prompt extensions append to the features of running requests.
+        for req_id, extension in prompt_extensions.items():
+            features = extension.mm_features
             start = len(self.requests[req_id].mm_features) - len(features)
             self._pending_encoder_input_ids.setdefault(req_id, set()).update(
                 i
