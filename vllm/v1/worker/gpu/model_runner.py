@@ -1328,7 +1328,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
             if self.speculator is not None:
-                self.speculator.add_request(req_index, new_req_data)
+                self.speculator.add_request(req_index)
 
             if self.pooling_runner is not None:
                 assert new_req_data.pooling_params is not None
@@ -1386,12 +1386,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_index = self.req_states.req_id_to_index[req_id]
             self.req_states.extend_prompt(
                 req_index,
-                ext.start,
+                ext.prefix_len,
                 ext.token_ids,
+                int(num_computed_tokens_np[req_index]),
                 ext.sampling_params.max_tokens,  # type: ignore[arg-type]
             )
-            # Re-admit to the sampler, whose state (e.g. penalties, min_tokens)
+            # Re-admit with the new sampling params. The sampler's and the
+            # speculator's state (e.g. penalties, min_tokens, drafts) also
             # depends on the prompt.
+            self.draft_tokens_handler.discard(req_id)
+            if self.adaptive_verification is not None:
+                self.adaptive_verification.add_request(req_index)
+            if self.speculator is not None:
+                self.speculator.add_request(req_index)
             if self.is_last_pp_rank:
                 assert self.sampler is not None
                 self.sampler.add_request(req_index, ext.sampling_params)

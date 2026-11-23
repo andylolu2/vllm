@@ -37,7 +37,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from vllm.config.compilation import CUDAGraphMode
-    from vllm.v1.core.sched.output import NewRequestData
     from vllm.v1.worker.gpu.dp_utils import DPSyncState
     from vllm.v1.worker.gpu.states import RequestState
 
@@ -601,7 +600,7 @@ class SuffixSpeculator(BaseSpeculator):
         # still belongs to the previous request.
         self.new_slots: list[int] = []
 
-    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+    def add_request(self, req_index: int) -> None:
         if self.enable_adaptive_verification:
             self.new_slots.append(req_index)
 

@@ -137,11 +137,12 @@ class NewRequestData:
 
 @dataclass
 class PromptExtension:
-    """Resumes a streaming session in place: the request's first `start` tokens
-    followed by `token_ids` become its prompt, and `mm_features` are appended to
-    its features, as if it was re-admitted with them but kept its KV cache."""
+    """Resumes a streaming session in place: the request's first `prefix_len`
+    tokens followed by `token_ids` become its prompt, `mm_features` are appended
+    to its features, and `sampling_params` replace its own, as if it was
+    re-admitted with them but kept its KV cache."""
 
-    start: int
+    prefix_len: int
     token_ids: list[int]
     mm_features: list[MultiModalFeatureSpec]
     sampling_params: SamplingParams

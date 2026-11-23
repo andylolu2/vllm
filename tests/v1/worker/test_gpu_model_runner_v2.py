@@ -767,8 +767,8 @@ def test_speculator_request_hooks(gpu_model_runner_for_requests):
     events: list[tuple[str, str]] = []
 
     class RecordingSpeculator:
-        def add_request(self, req_index, new_req_data):
-            events.append(("add", new_req_data.req_id))
+        def add_request(self, req_index):
+            events.append(("add", runner.req_states.index_to_req_id[req_index]))
 
         # A hook called after its slot is freed records nothing.
         def on_requests_finished(self, req_ids):

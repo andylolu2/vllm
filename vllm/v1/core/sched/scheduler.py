@@ -1829,10 +1829,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             encoder_input_updates=self._get_encoder_input_updates(
-                num_scheduled_tokens,
-                new_reqs_data,
-                cached_reqs_data.prompt_extensions,
-                scheduled_encoder_inputs,
+                num_scheduled_tokens, new_reqs_data, scheduled_encoder_inputs
             ),
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
@@ -2004,13 +2001,14 @@ class Scheduler(SchedulerInterface):
             return False
 
         assert start >= session.num_computed_tokens
-        in_place = self._can_resume_in_place(session, update)
-        if update.mm_features:
-            for mm_feature in update.mm_features:
-                mm_feature.mm_position = replace(
-                    mm_feature.mm_position, offset=mm_feature.mm_position.offset + start
-                )
-            session.mm_features.extend(update.mm_features)
+        in_place = self._can_resume_in_place(session)
+        new_mm_features = update.mm_features or []
+        first_new_mm_feature = len(session.mm_features)
+        for mm_feature in new_mm_features:
+            mm_feature.mm_position = replace(
+                mm_feature.mm_position, offset=mm_feature.mm_position.offset + start
+            )
+        session.mm_features.extend(new_mm_features)
 
         del session._all_token_ids[keep_end:]
         del session.block_hashes[start // self.hash_block_size :]
@@ -2037,18 +2035,31 @@ class Scheduler(SchedulerInterface):
         if parked:
             self.num_waiting_for_streaming_input -= 1
 
-        if in_place:
+        # Prompt logprobs and skipped prefix cache reads make re-admission
+        # recompute the prompt.
+        if in_place and session.prefix_cache_hit_limit is None:
             assert session.sampling_params is not None
             self._pending_prompt_extensions[session.request_id] = PromptExtension(
-                start=keep_end,
+                prefix_len=keep_end,
                 token_ids=new_token_ids,
-                mm_features=update.mm_features or [],
+                mm_features=new_mm_features,
                 sampling_params=session.sampling_params,
+            )
+            # The workers receive the features' data with the extension.
+            pending = self._pending_encoder_input_ids.setdefault(
+                session.request_id, set()
+            )
+            pending.update(
+                i
+                for i, feature in enumerate(new_mm_features, first_new_mm_feature)
+                if feature.data is not None and "address" not in feature.data
             )
             if parked:
                 self.kv_holding_waiting.remove_request(session)
                 self.deferred_waiting.discard(session)
                 self.running.append(session)
+            # Drafts assigned while parked continue the previous chunk.
+            session.spec_token_ids = []
             session.status = RequestStatus.RUNNING
             return True
 
@@ -2067,18 +2078,16 @@ class Scheduler(SchedulerInterface):
             )
         self.dropped_streaming_updates.clear()
 
-    def _can_resume_in_place(self, session: Request, update: StreamingUpdate) -> bool:
+    def _can_resume_in_place(self, session: Request) -> bool:
+        """Whether the workers' state of the session, before its next update is
+        folded in, can be extended in place."""
         return (
-            session.sampling_params == update.sampling_params
-            # Prompt logprobs and skipped prefix cache reads make re-admission
-            # recompute the prompt.
-            and session.prefix_cache_hit_limit is None
-            # Preemption releases the KV cache and the worker state, and moves
-            # the session to the waiting queue.
-            and session.num_computed_tokens > 0
-            # The worker's last sample must be the session's last token. Under
-            # async scheduling, a stop before max_tokens can leave a step in
-            # flight that samples past it.
+            # Preemption frees the session's KV blocks and worker state. Its
+            # status can't tell: a session preempted mid-step parks all the same.
+            self._holds_kv_blocks(session)
+            # No step may be in flight: the workers would append its samples
+            # after the extension. Under async scheduling, a stop before
+            # max_tokens can leave one in flight.
             and (
                 not self.scheduler_config.async_scheduling
                 or session.num_output_tokens >= session.max_tokens
@@ -2087,8 +2096,6 @@ class Scheduler(SchedulerInterface):
             # the features at admission.
             and not self.model_uses_mrope
             and not self.vllm_config.model_config.is_mm_prefix_lm
-            and not self.use_pp
-            and not self.num_spec_tokens
         )
 
     def _make_cached_request_data(
@@ -2673,6 +2680,8 @@ class Scheduler(SchedulerInterface):
                 # reset the status for streaming requests that continue.
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
+                # A session resumed in place stays in the running batch.
+                resumed_in_place = request.status == RequestStatus.RUNNING
                 if finished:
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
                     if (
@@ -2686,13 +2695,12 @@ class Scheduler(SchedulerInterface):
                         kv_transfer_params["remote_prefill_cached_tokens"] = (
                             prefill_stats.num_cached_tokens
                         )
-                elif request.status != RequestStatus.RUNNING:
+                elif not resumed_in_place:
                     continuing_reqs.append(request)
 
                 if status_before_stop != RequestStatus.RUNNING:
                     stopped_preempted_reqs.add(request)
-                elif request.status != RequestStatus.RUNNING:
-                    # Not resumed in place.
+                elif not resumed_in_place:
                     stopped_running_reqs.add(request)
 
             if self.return_sampling_mask:
@@ -3053,7 +3061,6 @@ class Scheduler(SchedulerInterface):
         self,
         scheduled: dict[str, int],
         new_requests: list[NewRequestData],
-        prompt_extensions: dict[str, PromptExtension],
         scheduled_encoder_inputs: dict[str, list[int]],
     ) -> dict[str, dict[int, MultiModalKwargsItem | None]]:
         # Installations (including resume/streaming) replace worker features.
@@ -3067,15 +3074,6 @@ class Scheduler(SchedulerInterface):
                 for i, feature in enumerate(new_request.mm_features)
                 if feature.data is not None and "address" not in feature.data
             }
-        # Prompt extensions append to the features of running requests.
-        for req_id, extension in prompt_extensions.items():
-            features = extension.mm_features
-            start = len(self.requests[req_id].mm_features) - len(features)
-            self._pending_encoder_input_ids.setdefault(req_id, set()).update(
-                i
-                for i, feature in enumerate(features, start)
-                if feature.data is not None and "address" not in feature.data
-            )
 
         updates: dict[str, dict[int, MultiModalKwargsItem | None]] = {}
         for req_id in scheduled:
@@ -3161,6 +3159,11 @@ class Scheduler(SchedulerInterface):
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
+                continue
+
+            if req_id in self._pending_prompt_extensions:
+                # Drafts from the step the session stopped in continue the
+                # previous chunk, not the extended prompt.
                 continue
 
             # Add newly generated spec token ids to the request.

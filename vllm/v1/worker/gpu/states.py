@@ -118,18 +118,30 @@ class RequestState:
             self.draft_tokens[req_idx].zero_()
 
     def extend_prompt(
-        self, req_idx: int, start: int, token_ids: list[int], max_tokens: int
+        self,
+        req_idx: int,
+        prefix_len: int,
+        token_ids: list[int],
+        num_computed_tokens: int,
+        max_tokens: int,
     ) -> None:
-        """Make the first `start` tokens followed by `token_ids` the prompt,
-        folding in the outputs before `start` and dropping those after it.
+        """Make the first `prefix_len` tokens followed by `token_ids` the prompt,
+        folding in the outputs in the prefix and dropping those after it.
 
+        `num_computed_tokens` is the scheduler's count, which a stop puts behind
+        the workers' when it drops accepted drafts after the stop token.
         Must not be called with a step of the request in flight."""
-        prompt_len = start + len(token_ids)
+        prompt_len = prefix_len + len(token_ids)
         self.max_seq_len[req_idx] = prompt_len + max_tokens
         self.prompt_len.np[req_idx] = prompt_len
         self.prefill_len.np[req_idx] = prompt_len
         self.total_len.stage_write_elem(req_idx, prompt_len)
-        self.all_token_ids.stage_write(req_idx, start, token_ids)
+        self.all_token_ids.stage_write(req_idx, prefix_len, token_ids)
+        self.num_computed_tokens_np[req_idx] = num_computed_tokens
+        self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
+
+        if self.num_speculative_steps > 0:
+            self.draft_tokens[req_idx].zero_()
 
     def apply_staged_writes(self) -> None:
         self.prompt_len.copy_to_uva()

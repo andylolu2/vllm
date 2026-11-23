@@ -738,10 +738,14 @@ def _model_output(request_id: str, token_ids: list[int]) -> ModelRunnerOutput:
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
-def test_next_chunk_fully_computed_after_stop_on_accepted_draft(async_scheduling):
+@pytest.mark.parametrize("chunk_queued_before_stop", [False, True])
+def test_next_chunk_fully_computed_after_stop_on_accepted_draft(
+    async_scheduling, chunk_queued_before_stop
+):
     """A stop on an accepted draft trims the step's later tokens. The next
     chunk must still be computed in full rather than landing on positions
-    whose KV belongs to the trimmed drafts."""
+    whose KV belongs to the trimmed drafts: the workers resume from the
+    scheduler's count. Drafts proposed in the stop's step are dropped."""
     scheduler = create_spec_scheduler(
         num_speculative_tokens=2,
         async_scheduling=async_scheduling,
@@ -751,17 +755,24 @@ def test_next_chunk_fully_computed_after_stop_on_accepted_draft(async_scheduling
     scheduler.add_request(session)
     scheduler.update_from_output(scheduler.schedule(), _model_output("session", [10]))
     scheduler.update_draft_token_ids(DraftTokenIds(["session"], [[11, 12]]))
+    chunk = DummyRequest("session", prompt_token_ids=[7, 8])
+    if chunk_queued_before_stop:
+        scheduler.add_request(chunk)
     # Both drafts are accepted, but max_tokens stops at 11.
     scheduler.update_from_output(
         scheduler.schedule(), _model_output("session", [11, 12, 13])
     )
-    assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
-
-    scheduler.add_request(DummyRequest("session", prompt_token_ids=[7, 8]))
+    scheduler.update_draft_token_ids(DraftTokenIds(["session"], [[14, 15]]))
+    if not chunk_queued_before_stop:
+        assert session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+        scheduler.add_request(chunk)
     output = scheduler.schedule()
 
     assert list(session.prompt_token_ids) == [1, 2, 3, 10, 7, 8]
+    assert output.scheduled_cached_reqs.num_computed_tokens == [4]
+    assert output.scheduled_cached_reqs.prompt_extensions["session"].prefix_len == 4
     assert output.num_scheduled_tokens["session"] == 2
+    assert not output.scheduled_spec_decode_tokens
 
 
 @pytest.mark.parametrize("chunk_queued_before_stop", [False, True])
@@ -822,42 +833,6 @@ def _audio_feature(offset: int, identifier: str = "") -> MultiModalFeatureSpec:
         identifier=identifier,
         mm_position=PlaceholderRange(offset=offset, length=1),
     )
-
-
-@pytest.mark.parametrize(
-    ("keep_last_output_token", "new_token_ids", "expected_prompt"),
-    [
-        (True, [], [1, 2, 3, 10, 11]),
-        (True, [20, 21], [1, 2, 3, 10, 11, 20, 21]),
-        (False, [20, 21], [1, 2, 3, 10, 20, 21]),
-    ],
-)
-def test_update_request_as_session_folds_outputs_into_prompt(
-    keep_last_output_token, new_token_ids, expected_prompt
-):
-    """The outputs become prompt tokens, without the last one unless the
-    update keeps it. The update's features count from its first token."""
-    scheduler = create_scheduler()
-    session = DummyRequest("session", prompt_token_ids=[1, 2, 3])
-    session.append_output_token_ids([10, 11])
-    session.num_computed_tokens = 4
-
-    update = StreamingUpdate.from_request(
-        DummyRequest(
-            "session",
-            prompt_token_ids=new_token_ids,
-            mm_features=[_audio_feature(offset=0)],
-            keep_last_output_token=keep_last_output_token,
-        )
-    )
-    scheduler._update_request_as_session(session, update)
-
-    assert session.prompt_token_ids == expected_prompt
-    assert list(session.all_token_ids) == expected_prompt
-    assert session.num_prompt_tokens == len(expected_prompt)
-    assert session.num_output_tokens == 0
-    assert session.mm_features[0].mm_position.offset == 4
-    assert session.num_computed_tokens == 4
 
 
 def test_keep_last_output_token_rehashes_block_of_kept_token():
@@ -946,7 +921,7 @@ def test_session_resumes_in_place(async_scheduling, chunk_queued_before_stop):
         assert output.num_scheduled_tokens == {"session": 1}
         assert output.scheduled_cached_reqs.prompt_extensions == {
             "session": PromptExtension(
-                start=session.num_tokens,
+                prefix_len=session.num_tokens,
                 token_ids=[],
                 mm_features=[feature],
                 sampling_params=chunk.sampling_params,
@@ -968,7 +943,7 @@ def test_resume_in_place_matches_rebuild(
     keep_last_output_token, new_token_ids, monkeypatch
 ):
     """Resuming in place leaves the session, and the workers' view of it, as
-    re-admitting it with its folded prompt would."""
+    re-admitting it with its folded prompt and new sampling params would."""
     prompt = list(range(1, 20))
 
     def resume(in_place: bool) -> dict:
@@ -995,14 +970,14 @@ def test_resume_in_place_matches_rebuild(
                 prompt_token_ids=new_token_ids,
                 mm_features=[_audio_feature(offset=0, identifier="audio-1")],
                 keep_last_output_token=keep_last_output_token,
-                max_tokens=2,
+                max_tokens=3,
             )
         )
         output = scheduler.schedule()
         if in_place:
             assert not output.scheduled_new_reqs
             ext = output.scheduled_cached_reqs.prompt_extensions["session"]
-            worker_token_ids = worker_token_ids[: ext.start] + ext.token_ids
+            worker_token_ids = worker_token_ids[: ext.prefix_len] + ext.token_ids
             worker_prompt_len = len(worker_token_ids)
             worker_sampling_params = ext.sampling_params
             worker_mm_features += ext.mm_features
@@ -1036,9 +1011,14 @@ def test_resume_in_place_matches_rebuild(
 
     in_place = resume(in_place=True)
     assert in_place == resume(in_place=False)
+    # The outputs become prompt tokens, without the last one unless kept.
     kept = [31] if keep_last_output_token else []
-    assert in_place["worker_token_ids"] == [*prompt, 30, *kept, *new_token_ids]
-    assert in_place["worker_prompt_len"] == len(in_place["worker_token_ids"])
+    expected = [*prompt, 30, *kept, *new_token_ids]
+    assert in_place["prompt_token_ids"] == in_place["all_token_ids"] == expected
+    assert in_place["worker_token_ids"] == expected
+    assert in_place["worker_prompt_len"] == len(expected)
+    assert in_place["worker_sampling_params"].max_tokens == 3
+    # The update's features count from its first token.
     assert in_place["worker_mm_features"] == [
         ("audio-0", 2),
         ("audio-1", len(prompt) + 1),
@@ -1094,7 +1074,7 @@ _NEW_TOKENS = {"prompt_token_ids": [4], "keep_last_output_token": False}
     (
         "scheduler_kwargs",
         "scheduler_attrs",
-        "request_kwargs",
+        "session_kwargs",
         "chunk_kwargs",
         "in_place",
     ),
@@ -1106,34 +1086,30 @@ _NEW_TOKENS = {"prompt_token_ids": [4], "keep_last_output_token": False}
         pytest.param(
             {"async_scheduling": True}, {}, {}, {}, True, id="async_max_tokens"
         ),
+        pytest.param({}, {}, {}, {"max_tokens": 2}, True, id="new_sampling_params"),
+        # Re-admission would recompute the prompt for the new prompt logprobs.
         pytest.param(
-            {"async_scheduling": True},
-            {},
-            {"max_tokens": 4},
-            {},
-            False,
-            id="async_early_stop",
+            {}, {}, {}, {"prompt_logprobs": 0}, False, id="new_prompt_logprobs"
         ),
-        pytest.param({}, {}, {}, {"max_tokens": 2}, False, id="new_sampling_params"),
-        pytest.param({}, {}, {"prompt_logprobs": 0}, {}, False, id="prompt_logprobs"),
         pytest.param(
-            {"num_speculative_tokens": 1}, {}, {}, {}, False, id="spec_decode"
+            {}, {}, {"prompt_logprobs": 0}, {}, True, id="no_more_prompt_logprobs"
         ),
-        pytest.param({}, {"use_pp": True}, {}, {}, False, id="pp"),
+        pytest.param({"num_speculative_tokens": 1}, {}, {}, {}, True, id="spec_decode"),
+        pytest.param({}, {"use_pp": True}, {}, {}, True, id="pp"),
         pytest.param({}, {"model_uses_mrope": True}, {}, {}, False, id="mrope"),
     ],
 )
 def test_session_resume_in_place_conditions(
-    scheduler_kwargs, scheduler_attrs, request_kwargs, chunk_kwargs, in_place
+    scheduler_kwargs, scheduler_attrs, session_kwargs, chunk_kwargs, in_place
 ):
     scheduler = create_async_scheduler(**scheduler_kwargs)
-    session = _chunk(prompt_token_ids=[1, 2, 3], **request_kwargs)
+    session = _chunk(prompt_token_ids=[1, 2, 3], **session_kwargs)
     scheduler.add_request(session)
     output = scheduler.schedule()
     scheduler.update_from_output(output, _model_output("session", [STOP_TOKEN]))
     for name, value in scheduler_attrs.items():
         setattr(scheduler, name, value)
-    scheduler.add_request(_kept_chunk(**(request_kwargs | chunk_kwargs)))
+    scheduler.add_request(_kept_chunk(**chunk_kwargs))
 
     assert session.status == (
         RequestStatus.RUNNING if in_place else RequestStatus.WAITING

@@ -693,12 +693,13 @@ class StandaloneCPUModelRunner(LoRAModelRunnerMixin):
             req_index = self.req_states.req_id_to_index[req_id]
             self.req_states.extend_prompt(
                 req_index,
-                ext.start,
+                ext.prefix_len,
                 ext.token_ids,
+                int(num_computed_tokens_np[req_index]),
                 ext.sampling_params.max_tokens,  # type: ignore[arg-type]
             )
-            # Re-admit to the sampler, whose state (e.g. penalties, min_tokens)
-            # depends on the prompt.
+            # Re-admit with the new sampling params. The sampler's state (e.g.
+            # penalties, min_tokens) also depends on the prompt.
             if self.is_last_pp_rank:
                 assert self.sampler is not None
                 self.sampler.add_request(req_index, ext.sampling_params)

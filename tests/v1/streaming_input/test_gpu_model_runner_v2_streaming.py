@@ -185,34 +185,39 @@ def test_e2e_streaming_with_multimodal_features(
 
 
 @pytest.mark.parametrize(
-    ("start", "new_token_ids"),
+    ("prefix_len", "new_token_ids"),
     [(5, []), (5, [20, 21]), (4, [20, 21])],
     ids=["kept_token", "kept_token_and_new_tokens", "new_tokens"],
 )
 def test_prompt_extension_matches_readmission(
-    gpu_model_runner_for_requests, start, new_token_ids
+    gpu_model_runner_for_requests, prefix_len, new_token_ids
 ):
     """Extending a request's prompt in place leaves its state as re-admitting
-    it with the folded prompt and features would, and re-admits it to the
-    sampler."""
+    it with the folded prompt, features and new sampling params would, and
+    re-admits it to the sampler and the speculator."""
     runner = gpu_model_runner_for_requests
     runner.sampler = MagicMock()
     runner.prompt_logprobs_worker = MagicMock()
+    runner.speculator = MagicMock()
+    runner.adaptive_verification = MagicMock()
     runner.encoder_cache = EncoderCache()
     req_states = runner.req_states
-    sampling_params = SamplingParams(max_tokens=4)
+    held_sampling_params = SamplingParams(max_tokens=4)
+    sampling_params = SamplingParams(max_tokens=6)
     # The workers hold the prompt and the samples 10 and 11, of which only 10
     # has been computed.
     held = [1, 2, 3, 10, 11]
-    folded = held[:start] + new_token_ids
+    folded = held[:prefix_len] + new_token_ids
     held_features = [_audio_feature("audio-0", offset=1, length=1)]
     new_features = (
-        [_audio_feature("audio-1", offset=start, length=len(new_token_ids))]
+        [_audio_feature("audio-1", offset=prefix_len, length=len(new_token_ids))]
         if new_token_ids
         else []
     )
 
-    def new_req_data(req_id, prompt_token_ids, prefill_token_ids, mm_features):
+    def new_req_data(
+        req_id, prompt_token_ids, prefill_token_ids, mm_features, sampling_params
+    ):
         return NewRequestData(
             req_id=req_id,
             prompt_token_ids=prompt_token_ids,
@@ -228,15 +233,31 @@ def test_prompt_extension_matches_readmission(
     runner.add_requests(
         _make_scheduler_output(
             [
-                new_req_data("in_place", [1, 2, 3], held, held_features),
                 new_req_data(
-                    "readmitted", folded, folded, held_features + new_features
+                    "in_place", [1, 2, 3], held, held_features, held_sampling_params
+                ),
+                new_req_data(
+                    "readmitted",
+                    folded,
+                    folded,
+                    held_features + new_features,
+                    sampling_params,
                 ),
             ]
         )
     )
-    runner.sampler.reset_mock()
-    runner.prompt_logprobs_worker.reset_mock()
+    for worker in (
+        runner.sampler,
+        runner.prompt_logprobs_worker,
+        runner.speculator,
+        runner.adaptive_verification,
+    ):
+        worker.reset_mock()
+    i = req_states.req_id_to_index["in_place"]
+    j = req_states.req_id_to_index["readmitted"]
+    # A stop that drops accepted drafts leaves the workers ahead of the
+    # scheduler.
+    req_states.num_computed_tokens.gpu[i] = len(held)
 
     runner.update_requests(
         _make_scheduler_output(
@@ -249,7 +270,7 @@ def test_prompt_extension_matches_readmission(
                 num_output_tokens=[0],
                 prompt_extensions={
                     "in_place": PromptExtension(
-                        start=start,
+                        prefix_len=prefix_len,
                         token_ids=new_token_ids,
                         mm_features=new_features,
                         sampling_params=sampling_params,
@@ -259,8 +280,6 @@ def test_prompt_extension_matches_readmission(
         )
     )
 
-    i = req_states.req_id_to_index["in_place"]
-    j = req_states.req_id_to_index["readmitted"]
     for state in (
         req_states.prompt_len.np,
         req_states.prefill_len.np,
@@ -272,6 +291,8 @@ def test_prompt_extension_matches_readmission(
     assert req_states.prompt_len.np[i] == len(folded)
     total_len = req_states.total_len.gpu.cpu()
     assert total_len[i] == total_len[j] == len(folded)
+    num_computed_tokens = req_states.num_computed_tokens.gpu.cpu()
+    assert num_computed_tokens[i] == num_computed_tokens[j] == 4
     all_token_ids = req_states.all_token_ids.gpu[:, : len(folded)].cpu()
     assert all_token_ids[i].tolist() == all_token_ids[j].tolist() == folded
     assert (
@@ -285,3 +306,5 @@ def test_prompt_extension_matches_readmission(
     runner.prompt_logprobs_worker.add_request.assert_called_once_with(
         "in_place", i, sampling_params
     )
+    runner.speculator.add_request.assert_called_once_with(i)
+    runner.adaptive_verification.add_request.assert_called_once_with(i)
